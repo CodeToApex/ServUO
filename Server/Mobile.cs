@@ -532,7 +532,7 @@ namespace Server
 	///     Base class representing players, npcs, and creatures.
 	/// </summary>
     [System.Runtime.InteropServices.ComVisible(true)]
-	public class Mobile : IEntity, IHued, IComparable<Mobile>, ISerializable, ISpawnable, IDamageable
+	public partial class Mobile : IEntity, IHued, IComparable<Mobile>, ISerializable, ISpawnable, IDamageable
 	{
 		#region CompareTo(...)
 		public int CompareTo(IEntity other)
@@ -777,8 +777,6 @@ namespace Server
 		private Target m_Target;
 		private Prompt m_Prompt;
 		private ContextMenu m_ContextMenu;
-		private List<AggressorInfo> m_Aggressors, m_Aggressed;
-		private IDamageable m_Combatant;
 		private List<Mobile> m_Stabled;
 		private bool m_AutoPageNotify;
 		private bool m_CanHearGhosts;
@@ -788,11 +786,9 @@ namespace Server
 		private bool m_DisplayGuildAbbr;
 		private Mobile m_GuildFealty;
 		private DateTime[] m_StuckMenuUses;
-		private Timer m_ExpireCombatant;
 		private Timer m_ExpireCriminal;
 		private Timer m_ExpireAggrTimer;
 		private Timer m_LogoutTimer;
-		private Timer m_CombatTimer;
 		private Timer m_ManaTimer, m_HitsTimer, m_StamTimer;
 		private long m_NextSkillTime;
 		private long m_NextActionMessage;
@@ -1530,8 +1526,6 @@ namespace Server
 		[CommandProperty(AccessLevel.GameMaster)]
 		public int BaseSoundID { get { return m_BaseSoundID; } set { m_BaseSoundID = value; } }
 
-		public long NextCombatTime { get { return m_NextCombatTime; } set { m_NextCombatTime = value; } }
-
 		public bool BeginAction(object toLock)
 		{
 			if (_actions == null)
@@ -2035,70 +2029,6 @@ namespace Server
 			}
 		}
 
-		private class CombatTimer : Timer
-		{
-			private readonly Mobile m_Mobile;
-
-			public CombatTimer(Mobile m)
-				: base(TimeSpan.FromSeconds(0.0), TimeSpan.FromSeconds(0.01), 0)
-			{
-				m_Mobile = m;
-
-				if (!m_Mobile.m_Player && m_Mobile.m_Dex <= 100)
-				{
-					Priority = TimerPriority.FiftyMS;
-				}
-			}
-
-			protected override void OnTick()
-			{
-				if (Core.TickCount - m_Mobile.m_NextCombatTime >= 0)
-				{
-					IDamageable combatant = m_Mobile.Combatant;
-
-					// If no combatant, wrong map, one of us is a ghost, or cannot see, or deleted, then stop combat
-					if (combatant == null || combatant.Deleted || m_Mobile.m_Deleted || combatant.Map != m_Mobile.m_Map ||
-						!combatant.Alive || !m_Mobile.Alive || !m_Mobile.CanSee(combatant) || (combatant is Mobile && ((Mobile)combatant).IsDeadBondedPet) ||
-						m_Mobile.IsDeadBondedPet)
-					{
-						m_Mobile.Combatant = null;
-						return;
-					}
-
-					IWeapon weapon = m_Mobile.Weapon;
-
-					if (!m_Mobile.InRange(combatant, weapon.MaxRange))
-					{
-						return;
-					}
-
-                    if (m_Mobile.InLOS(combatant))
-                    {
-                        weapon.OnBeforeSwing(m_Mobile, combatant); //OnBeforeSwing for checking in regards to being hidden and whatnot
-                        m_Mobile.RevealingAction();
-                        m_Mobile.m_NextCombatTime = Core.TickCount + (int)weapon.OnSwing(m_Mobile, combatant).TotalMilliseconds;
-                    }
-				}
-			}
-		}
-
-		private class ExpireCombatantTimer : Timer
-		{
-			private readonly Mobile m_Mobile;
-
-			public ExpireCombatantTimer(Mobile m)
-				: base(TimeSpan.FromMinutes(1.0))
-			{
-				Priority = TimerPriority.FiveSeconds;
-				m_Mobile = m;
-			}
-
-			protected override void OnTick()
-			{
-				m_Mobile.Combatant = null;
-			}
-		}
-
 		private static TimeSpan m_ExpireCriminalDelay = TimeSpan.FromMinutes(2.0);
 
 		public static TimeSpan ExpireCriminalDelay { get { return m_ExpireCriminalDelay; } set { m_ExpireCriminalDelay = value; } }
@@ -2145,128 +2075,11 @@ namespace Server
 		}
 		#endregion
 
-		private long m_NextCombatTime;
-
 		[CommandProperty(AccessLevel.GameMaster)]
 		public long NextSkillTime { get { return m_NextSkillTime; } set { m_NextSkillTime = value; } }
-
-		public List<AggressorInfo> Aggressors { get { return m_Aggressors; } }
-
-		public List<AggressorInfo> Aggressed { get { return m_Aggressed; } }
-
-		private int m_ChangingCombatant;
-
-		public bool ChangingCombatant { get { return (m_ChangingCombatant > 0); } }
-
-		public virtual void Attack(IDamageable e)
-		{
-			if (CheckAttack(e))
-			{
-                if (!m_Warmode)
-                {
-                    Warmode = true;
-                }
-
-				Combatant = e;
-			}
-		}
-
-        public virtual bool CheckAttack(IDamageable e)
-		{
-			return (Utility.InUpdateRange(this, e.Location) && CanSee(e) && InLOS(e));
-		}
 		
 		[CommandProperty(AccessLevel.GameMaster)]
 		public bool GuardImmune { get; set; }
-
-		/// <summary>
-		///     Overridable. Gets or sets which Mobile that this Mobile is currently engaged in combat with.
-		///     <seealso cref="OnCombatantChange" />
-		/// </summary>
-		[CommandProperty(AccessLevel.GameMaster)]
-		public virtual IDamageable Combatant
-		{
-			get { return m_Combatant; }
-			set
-			{
-				if (m_Deleted)
-				{
-					return;
-				}
-
-				if (m_Combatant != value && value != this)
-				{
-					IDamageable old = m_Combatant;
-
-					++m_ChangingCombatant;
-					m_Combatant = value;
-
-					if (!Region.OnCombatantChange(this, old, m_Combatant) || (m_Combatant != null && !CanBeHarmful(m_Combatant, false)))
-					{
-						m_Combatant = old;
-						--m_ChangingCombatant;
-						return;
-					}
-
-					if (m_NetState != null)
-					{
-						m_NetState.Send(new ChangeCombatant(m_Combatant));
-					}
-
-					if (m_Combatant == null)
-					{
-						if (m_ExpireCombatant != null)
-						{
-							m_ExpireCombatant.Stop();
-						}
-
-						if (m_CombatTimer != null)
-						{
-							m_CombatTimer.Stop();
-						}
-
-						m_ExpireCombatant = null;
-						m_CombatTimer = null;
-					}
-					else
-					{
-						if (m_ExpireCombatant == null)
-						{
-							m_ExpireCombatant = new ExpireCombatantTimer(this);
-						}
-
-						m_ExpireCombatant.Start();
-
-						if (m_CombatTimer == null)
-						{
-							m_CombatTimer = new CombatTimer(this);
-						}
-
-						m_CombatTimer.Start();
-					}
-
-					if (m_Combatant != null && CanBeHarmful(m_Combatant, false))
-					{
-						DoHarmful(m_Combatant);
-
-						if (m_Combatant is Mobile)
-						{
-                            ((Mobile)m_Combatant).PlaySound(((Mobile)m_Combatant).GetAngerSound());
-						}
-					}
-
-					OnCombatantChange();
-					--m_ChangingCombatant;
-				}
-			}
-		}
-
-		/// <summary>
-		///     Overridable. Virtual event invoked after the <see cref="Combatant" /> property has changed.
-		///     <seealso cref="Combatant" />
-		/// </summary>
-		public virtual void OnCombatantChange()
-		{ }
 
 		public double GetDistanceToSqrt(Point3D p)
 		{
@@ -2290,194 +2103,6 @@ namespace Server
 			int yDelta = m_Location.m_Y - p.Y;
 
 			return Math.Sqrt((xDelta * xDelta) + (yDelta * yDelta));
-		}
-
-		public virtual void AggressiveAction(Mobile aggressor)
-		{
-			AggressiveAction(aggressor, false);
-		}
-
-        public virtual void AggressiveAction(Mobile aggressor, bool criminal)
-        {
-            if (aggressor == this)
-                return;
-
-            AggressiveActionEventArgs args = AggressiveActionEventArgs.Create(this, aggressor, criminal);
-
-            EventSink.InvokeAggressiveAction(args);
-
-            args.Free();
-
-            if (Combatant == aggressor)
-            {
-                if (m_ExpireCombatant == null)
-                    m_ExpireCombatant = new ExpireCombatantTimer(this);
-                else
-                    m_ExpireCombatant.Stop();
-
-                m_ExpireCombatant.Start();
-            }
-
-            bool addAggressor = true;
-
-			var list = m_Aggressors;
-
-            for (int i = 0; i < list.Count; ++i)
-            {
-                AggressorInfo info = list[i];
-
-                if (info.Attacker == aggressor)
-                {
-                    info.Refresh();
-                    info.CriminalAggression = criminal;
-                    info.CanReportMurder = criminal;
-
-                    addAggressor = false;
-                }
-            }
-
-            list = aggressor.m_Aggressors;
-
-            for (int i = 0; i < list.Count; ++i)
-            {
-                AggressorInfo info = list[i];
-
-                if (info.Attacker == this)
-                {
-                    info.Refresh();
-
-                    addAggressor = false;
-                }
-            }
-
-            bool addAggressed = true;
-
-            list = m_Aggressed;
-
-            for (int i = 0; i < list.Count; ++i)
-            {
-                AggressorInfo info = list[i];
-
-                if (info.Defender == aggressor)
-                {
-                    info.Refresh();
-
-                    addAggressed = false;
-                }
-            }
-
-            list = aggressor.m_Aggressed;
-
-            for (int i = 0; i < list.Count; ++i)
-            {
-                AggressorInfo info = list[i];
-
-                if (info.Defender == this)
-                {
-                    info.Refresh();
-                    info.CriminalAggression = criminal;
-                    info.CanReportMurder = criminal;
-
-                    addAggressed = false;
-                }
-            }
-
-            bool setCombatant = false;
-
-            if (addAggressor)
-            {
-                m_Aggressors.Add(AggressorInfo.Create(aggressor, this, criminal));
-
-                if (CanSee(aggressor) && m_NetState != null)
-                {
-                    m_NetState.Send(MobileIncoming.Create(m_NetState, this, aggressor));
-                }
-
-                if (Combatant == null)
-                    setCombatant = true;
-
-                UpdateAggrExpire();
-            }
-
-            if (addAggressed)
-            {
-                aggressor.m_Aggressed.Add(AggressorInfo.Create(aggressor, this, criminal));
-
-                if (CanSee(aggressor) && m_NetState != null)
-                {
-                    m_NetState.Send(MobileIncoming.Create(m_NetState, this, aggressor));
-                }
-
-                if (Combatant == null)
-                    setCombatant = true;
-
-                UpdateAggrExpire();
-            }
-
-            if (setCombatant && !Hidden)
-                Combatant = aggressor;
-
-            Region.OnAggressed(aggressor, this, criminal);
-        }
-
-		public void RemoveAggressed(Mobile aggressed)
-		{
-			if (m_Deleted)
-			{
-				return;
-			}
-
-			var list = m_Aggressed;
-
-			for (int i = 0; i < list.Count; ++i)
-			{
-				AggressorInfo info = list[i];
-
-				if (info.Defender == aggressed)
-				{
-					m_Aggressed.RemoveAt(i);
-					info.Free();
-
-					if (m_NetState != null && CanSee(aggressed))
-					{
-						m_NetState.Send(MobileIncoming.Create(m_NetState, this, aggressed));
-					}
-
-					break;
-				}
-			}
-
-			UpdateAggrExpire();
-		}
-
-		public void RemoveAggressor(Mobile aggressor)
-		{
-			if (m_Deleted)
-			{
-				return;
-			}
-
-			var list = m_Aggressors;
-
-			for (int i = 0; i < list.Count; ++i)
-			{
-				AggressorInfo info = list[i];
-
-				if (info.Attacker == aggressor)
-				{
-					m_Aggressors.RemoveAt(i);
-					info.Free();
-
-					if (m_NetState != null && CanSee(aggressor))
-					{
-						m_NetState.Send(MobileIncoming.Create(m_NetState, this, aggressor));
-					}
-
-					break;
-				}
-			}
-
-			UpdateAggrExpire();
 		}
 
 		[CommandProperty(AccessLevel.GameMaster)]
