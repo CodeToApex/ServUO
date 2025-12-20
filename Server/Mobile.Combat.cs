@@ -3,36 +3,355 @@
 // Note: To avoid duplicate symbol definitions during compilation, this file places the members
 // inside a partial class and does not redefine types already defined elsewhere in Mobile.cs.
 
+using Server.Network;
 using System;
 using System.Collections.Generic;
-using System.Text;
-using System.Threading;
-
-using Server.Items;
-using Server.Network;
-using Server.Menus;
-using Server.Targeting;
-using Server.ContextMenus;
-using Server.Gumps;
+using System.Runtime.CompilerServices;
 
 namespace Server
 {
     public partial class Mobile
     {
-        // Combat-related fields
+        // Campi combat
+        private BattleGroup m_BattleGroup;
+        private List<AggressorInfo> m_Aggressors = new List<AggressorInfo>();
+        private List<AggressorInfo> m_Aggressed = new List<AggressorInfo>();
+        private CombatTimer m_CombatTimer;
+        private ExpireCombatantTimer m_ExpireCombatant;
         private long m_NextCombatTime;
         private IDamageable m_Combatant;
-        private List<AggressorInfo> m_Aggressors, m_Aggressed;
         private int m_ChangingCombatant;
-        private Timer m_ExpireCombatant;
-        private Timer m_CombatTimer;
+
+        // Hook di inizializzazione per cleanup su delete/disconnessione
+        private static readonly bool s_CombatCleanupHooks = InitCombatCleanupHooks();
+
+        public List<AggressorInfo> Aggressors => m_Aggressors;
+        public List<AggressorInfo> Aggressed => m_Aggressed;
+
+        public long NextCombatTime
+        {
+            get => m_NextCombatTime;
+            set => m_NextCombatTime = value;
+        }
+
+        // BattleGroup property (may be null)
+        public BattleGroup Battle => m_BattleGroup;
+
+        // Hook di inizializzazione per cleanup su delete/disconnessione
+        private static bool InitCombatCleanupHooks()
+        {
+            EventSink.MobileDeleted += e => CleanupBattleGroup(e.Mobile);
+            EventSink.Logout += e => CleanupBattleGroup(e.Mobile);
+            return true;
+        }
+
+        private static void CleanupBattleGroup(Mobile mobile)
+        {
+            if (mobile == null)
+            {
+                return;
+            }
+
+            BattleGroup group = mobile.m_BattleGroup;
+
+            if (group != null)
+            {
+                group.Remove(mobile);
+                mobile.m_BattleGroup = null;
+
+                // Ripulisce membri invalidi e, se restano collegamenti, ricompone i componenti connessi
+                if (group.ValidateIntegrity())
+                {
+                    RecomputeBattleGroups(group);
+                }
+            }
+        }
+
+        // BattleGroup represents a collection of Mobiles connected via combat/aggression.
+        // Annidata per poter accedere ai campi privati di Mobile.
+        public class BattleGroup
+        {
+            private readonly List<Mobile> m_Members;
+            private readonly IReadOnlyList<Mobile> m_MembersView;
+
+            public IReadOnlyList<Mobile> Members => m_MembersView;
+
+            private readonly object m_Sync = new object();
+            private static readonly object s_NoopLock = new object();
+
+            public BattleGroup()
+            {
+                m_Members = new List<Mobile>();
+                m_MembersView = m_Members.AsReadOnly();
+            }
+
+            public void Add(Mobile mobile)
+            {
+                if (mobile == null || mobile.Deleted)
+                {
+                    return;
+                }
+
+                BattleGroup oldGroup = mobile.m_BattleGroup;
+                if (oldGroup != null && oldGroup != this)
+                {
+                    oldGroup.Remove(mobile);
+                }
+
+                lock (m_Sync)
+                {
+                    if (!m_Members.Contains(mobile))
+                    {
+                        m_Members.Add(mobile);
+                    }
+
+                    if (mobile.m_BattleGroup != this)
+                    {
+                        mobile.m_BattleGroup = this;
+                    }
+                }
+            }
+
+            public void Remove(Mobile mobile)
+            {
+                if (mobile == null)
+                {
+                    return;
+                }
+
+                lock (m_Sync)
+                {
+                    m_Members.Remove(mobile);
+                }
+
+                if (mobile.m_BattleGroup == this)
+                {
+                    mobile.m_BattleGroup = null;
+                }
+            }
+
+            public int Count()
+            {
+                lock (m_Sync)
+                {
+                    return m_Members.Count;
+                }
+            }
+
+            public bool ValidateIntegrity()
+            {
+                lock (m_Sync)
+                {
+                    HashSet<Mobile> seen = null;
+
+                    for (int i = m_Members.Count - 1; i >= 0; --i)
+                    {
+                        Mobile m = m_Members[i];
+
+                        if (m == null || m.Deleted || m.m_BattleGroup != this)
+                        {
+                            m_Members.RemoveAt(i);
+                            continue;
+                        }
+
+                        if (seen == null)
+                        {
+                            seen = new HashSet<Mobile>();
+                        }
+
+                        if (!seen.Add(m))
+                        {
+                            m_Members.RemoveAt(i);
+                        }
+                    }
+
+                    return m_Members.Count > 0;
+                }
+            }
+
+            public BattleGroup Join(BattleGroup other)
+            {
+                if (other == null || other == this)
+                {
+                    return this;
+                }
+
+                ValidateIntegrity();
+                other.ValidateIntegrity();
+
+                LockOrdered(this, other, () =>
+                {
+                    for (int i = 0; i < other.m_Members.Count; i++)
+                    {
+                        Mobile m = other.m_Members[i];
+                        if (m != null && !m.Deleted && !m_Members.Contains(m))
+                        {
+                            m_Members.Add(m);
+                            m.m_BattleGroup = this;
+                        }
+                    }
+
+                    other.m_Members.Clear();
+                });
+
+                return this;
+            }
+
+            public BattleGroup Split(IEnumerable<Mobile> membersToMove)
+            {
+                BattleGroup result = new BattleGroup();
+
+                if (membersToMove == null)
+                {
+                    return result;
+                }
+
+                lock (m_Sync)
+                {
+                    foreach (Mobile m in membersToMove)
+                    {
+                        if (m == null)
+                        {
+                            continue;
+                        }
+
+                        if (m_Members.Remove(m))
+                        {
+                            result.Add(m);
+                            if (m.m_BattleGroup != result)
+                            {
+                                m.m_BattleGroup = result;
+                            }
+                        }
+                    }
+                }
+
+                return result;
+            }
+
+            public Mobile[] SnapshotMembers()
+            {
+                lock (m_Sync)
+                {
+                    return m_Members.ToArray();
+                }
+            }
+
+            public void ReplaceMembers(IEnumerable<Mobile> members)
+            {
+                List<Mobile> toClear;
+                lock (m_Sync)
+                {
+                    toClear = new List<Mobile>(m_Members);
+                }
+
+                for (int i = 0; i < toClear.Count; i++)
+                {
+                    Mobile old = toClear[i];
+                    if (old != null && !old.Deleted && old.m_BattleGroup == this)
+                    {
+                        old.m_BattleGroup = null;
+                    }
+                }
+
+                List<Mobile> toAdd = new List<Mobile>();
+                if (members != null)
+                {
+                    foreach (Mobile m in members)
+                    {
+                        if (m != null && !m.Deleted)
+                        {
+                            BattleGroup oldGroup = m.m_BattleGroup;
+                            if (oldGroup != null && oldGroup != this)
+                            {
+                                oldGroup.Remove(m);
+                            }
+
+                            toAdd.Add(m);
+                        }
+                    }
+                }
+
+                lock (m_Sync)
+                {
+                    m_Members.Clear();
+
+                    for (int i = 0; i < toAdd.Count; i++)
+                    {
+                        Mobile m = toAdd[i];
+                        m_Members.Add(m);
+                        if (m.m_BattleGroup != this)
+                        {
+                            m.m_BattleGroup = this;
+                        }
+                    }
+                }
+            }
+
+            public void ForEachMember(Action<Mobile> action)
+            {
+                if (action == null)
+                {
+                    return;
+                }
+
+                Mobile[] copy;
+                lock (m_Sync)
+                {
+                    copy = m_Members.ToArray();
+                }
+
+                for (int i = 0; i < copy.Length; i++)
+                {
+                    action(copy[i]);
+                }
+            }
+
+            private static void LockOrdered(BattleGroup a, BattleGroup b, Action action)
+            {
+                if (action == null)
+                {
+                    return;
+                }
+
+                if (a == null || b == null || ReferenceEquals(a, b))
+                {
+                    lock ((a ?? b)?.m_Sync ?? s_NoopLock)
+                    {
+                        action();
+                    }
+
+                    return;
+                }
+
+                BattleGroup first = a;
+                BattleGroup second = b;
+
+                int h1 = RuntimeHelpers.GetHashCode(first.m_Sync);
+                int h2 = RuntimeHelpers.GetHashCode(second.m_Sync);
+
+                if (h1 > h2 || (h1 == h2 && RuntimeHelpers.GetHashCode(first) > RuntimeHelpers.GetHashCode(second)))
+                {
+                    first = b;
+                    second = a;
+                }
+
+                lock (first.m_Sync)
+                {
+                    lock (second.m_Sync)
+                    {
+                        action();
+                    }
+                }
+            }
+        }
 
         /// <summary>
         /// Overridable. Gets or sets which Mobile that this Mobile is currently engaged in combat with.
         /// </summary>
         public virtual IDamageable Combatant
         {
-            get { return m_Combatant; }
+            get => m_Combatant;
             set
             {
                 if (m_Deleted)
@@ -61,15 +380,8 @@ namespace Server
 
                     if (m_Combatant == null)
                     {
-                        if (m_ExpireCombatant != null)
-                        {
-                            m_ExpireCombatant.Stop();
-                        }
-
-                        if (m_CombatTimer != null)
-                        {
-                            m_CombatTimer.Stop();
-                        }
+                        m_ExpireCombatant?.Stop();
+                        m_CombatTimer?.Stop();
 
                         m_ExpireCombatant = null;
                         m_CombatTimer = null;
@@ -95,9 +407,9 @@ namespace Server
                     {
                         DoHarmful(m_Combatant);
 
-                        if (m_Combatant is Mobile)
+                        if (m_Combatant is Mobile mob)
                         {
-                            ((Mobile)m_Combatant).PlaySound(((Mobile)m_Combatant).GetAngerSound());
+                            mob.PlaySound(mob.GetAngerSound());
                         }
                     }
 
@@ -107,13 +419,7 @@ namespace Server
             }
         }
 
-        public bool ChangingCombatant { get { return (m_ChangingCombatant > 0); } }
-
-        public long NextCombatTime { get { return m_NextCombatTime; } set { m_NextCombatTime = value; } }
-
-        public List<AggressorInfo> Aggressors { get { return m_Aggressors; } }
-
-        public List<AggressorInfo> Aggressed { get { return m_Aggressed; } }
+        public bool ChangingCombatant => m_ChangingCombatant > 0;
 
         public virtual void Attack(IDamageable e)
         {
@@ -130,7 +436,7 @@ namespace Server
 
         public virtual bool CheckAttack(IDamageable e)
         {
-            return (Utility.InUpdateRange(this, e.Location) && CanSee(e) && InLOS(e));
+            return Utility.InUpdateRange(this, e.Location) && CanSee(e) && InLOS(e);
         }
 
         public virtual void AggressiveAction(Mobile aggressor)
@@ -141,28 +447,31 @@ namespace Server
         public virtual void AggressiveAction(Mobile aggressor, bool criminal)
         {
             if (aggressor == this)
+            {
                 return;
+            }
 
             AggressiveActionEventArgs args = AggressiveActionEventArgs.Create(this, aggressor, criminal);
-
             EventSink.InvokeAggressiveAction(args);
-
             args.Free();
 
             if (Combatant == aggressor)
             {
                 if (m_ExpireCombatant == null)
+                {
                     m_ExpireCombatant = new ExpireCombatantTimer(this);
+                }
                 else
+                {
                     m_ExpireCombatant.Stop();
+                }
 
                 m_ExpireCombatant.Start();
             }
 
             bool addAggressor = true;
 
-            var list = m_Aggressors;
-
+            List<AggressorInfo> list = m_Aggressors;
             for (int i = 0; i < list.Count; ++i)
             {
                 AggressorInfo info = list[i];
@@ -178,7 +487,6 @@ namespace Server
             }
 
             list = aggressor.m_Aggressors;
-
             for (int i = 0; i < list.Count; ++i)
             {
                 AggressorInfo info = list[i];
@@ -194,7 +502,6 @@ namespace Server
             bool addAggressed = true;
 
             list = m_Aggressed;
-
             for (int i = 0; i < list.Count; ++i)
             {
                 AggressorInfo info = list[i];
@@ -208,7 +515,6 @@ namespace Server
             }
 
             list = aggressor.m_Aggressed;
-
             for (int i = 0; i < list.Count; ++i)
             {
                 AggressorInfo info = list[i];
@@ -227,7 +533,9 @@ namespace Server
 
             if (addAggressor)
             {
-                m_Aggressors.Add(AggressorInfo.Create(aggressor, this, criminal));
+                // istanza per il lato “attacker -> this”
+                AggressorInfo ai = AggressorInfo.Create(aggressor, this, criminal);
+                m_Aggressors.Add(ai);
 
                 if (CanSee(aggressor) && m_NetState != null)
                 {
@@ -235,14 +543,18 @@ namespace Server
                 }
 
                 if (Combatant == null)
+                {
                     setCombatant = true;
+                }
 
                 UpdateAggrExpire();
             }
 
             if (addAggressed)
             {
-                aggressor.m_Aggressed.Add(AggressorInfo.Create(aggressor, this, criminal));
+                // istanza separata per il lato “this <- attacker”
+                AggressorInfo ai = AggressorInfo.Create(aggressor, this, criminal);
+                aggressor.m_Aggressed.Add(ai);
 
                 if (CanSee(aggressor) && m_NetState != null)
                 {
@@ -250,13 +562,23 @@ namespace Server
                 }
 
                 if (Combatant == null)
+                {
                     setCombatant = true;
+                }
 
                 UpdateAggrExpire();
             }
 
+            // Manage BattleGroup relationships based on aggression
+            if (addAggressor || addAggressed)
+            {
+                EnsureBattleGroupWith(aggressor);
+            }
+
             if (setCombatant && !Hidden)
+            {
                 Combatant = aggressor;
+            }
 
             Region.OnAggressed(aggressor, this, criminal);
         }
@@ -268,7 +590,7 @@ namespace Server
                 return;
             }
 
-            var list = m_Aggressed;
+            List<AggressorInfo> list = m_Aggressed;
 
             for (int i = 0; i < list.Count; ++i)
             {
@@ -289,6 +611,7 @@ namespace Server
             }
 
             UpdateAggrExpire();
+            CheckBattleGroupIntegrity();
         }
 
         public void RemoveAggressor(Mobile aggressor)
@@ -298,7 +621,7 @@ namespace Server
                 return;
             }
 
-            var list = m_Aggressors;
+            List<AggressorInfo> list = m_Aggressors;
 
             for (int i = 0; i < list.Count; ++i)
             {
@@ -319,6 +642,261 @@ namespace Server
             }
 
             UpdateAggrExpire();
+            CheckBattleGroupIntegrity();
+        }
+
+        /// <summary>
+        /// Verifica l'integrità del BattleGroup e lo pulisce se necessario.
+        /// Se il mobile non ha più link di aggressione, viene rimosso dal BattleGroup.
+        /// Se il BattleGroup si è frammentato, viene ricomputato.
+        /// </summary>
+        private void CheckBattleGroupIntegrity()
+        {
+            if (m_BattleGroup == null)
+            {
+                return;
+            }
+
+            // Rimuove membri non validi e, se il gruppo resta vuoto, annulla il riferimento
+            if (!m_BattleGroup.ValidateIntegrity())
+            {
+                m_BattleGroup = null;
+                return;
+            }
+
+            if (m_Aggressors.Count > 0 || m_Aggressed.Count > 0)
+            {
+                RecomputeBattleGroups(m_BattleGroup);
+                return;
+            }
+
+            m_BattleGroup.Remove(this);
+            m_BattleGroup = null;
+        }
+
+        /// <summary>
+        /// Assicura che due mobile siano nello stesso BattleGroup, creandone uno nuovo o unendone due esistenti.
+        /// </summary>
+        private void EnsureBattleGroupWith(Mobile other)
+        {
+            if (other == null || other == this)
+            {
+                return;
+            }
+
+            BattleGroup g1 = m_BattleGroup;
+            BattleGroup g2 = other.m_BattleGroup;
+
+            if (g1 != null && !g1.ValidateIntegrity())
+            {
+                g1 = null;
+                m_BattleGroup = null;
+            }
+
+            if (g2 != null && !g2.ValidateIntegrity())
+            {
+                g2 = null;
+                other.m_BattleGroup = null;
+            }
+
+            if (g1 == null && g2 == null)
+            {
+                BattleGroup newGroup = new BattleGroup();
+                newGroup.Add(this);
+                newGroup.Add(other);
+
+                m_BattleGroup = newGroup;
+                other.m_BattleGroup = newGroup;
+                return;
+            }
+
+            if (g1 == null && g2 != null)
+            {
+                g2.Add(this);
+                m_BattleGroup = g2;
+                return;
+            }
+
+            if (g1 != null && g2 == null)
+            {
+                g1.Add(other);
+                other.m_BattleGroup = g1;
+                return;
+            }
+
+            if (g1 != null && g2 != null && g1 != g2)
+            {
+                MergeBattleGroups(g1, g2);
+            }
+        }
+
+        /// <summary>
+        /// Unisce due BattleGroup, mantenendo il più grande e trasferendo i membri dell'altro.
+        /// </summary>
+        private void MergeBattleGroups(BattleGroup group1, BattleGroup group2)
+        {
+            if (group1 != null && !group1.ValidateIntegrity())
+            {
+                group1 = null;
+            }
+
+            if (group2 != null && !group2.ValidateIntegrity())
+            {
+                group2 = null;
+            }
+
+            if (group1 == null || group2 == null)
+            {
+                return;
+            }
+
+            BattleGroup targetGroup = group1.Count() >= group2.Count() ? group1 : group2;
+            BattleGroup sourceGroup = targetGroup == group1 ? group2 : group1;
+
+            targetGroup.Join(sourceGroup);
+
+            AssignBattleGroup(targetGroup, targetGroup.SnapshotMembers());
+        }
+
+        /// <summary>
+        /// Ricomputa i componenti connessi all'interno di un BattleGroup e divide se necessario.
+        /// Questo garantisce che solo i mobile collegati tramite aggressione rimangono nello stesso gruppo.
+        /// </summary>
+        private static void RecomputeBattleGroups(BattleGroup group)
+        {
+            if (group == null || !group.ValidateIntegrity() || group.Count() <= 1)
+            {
+                return;
+            }
+
+            Mobile[] originalMembers = group.SnapshotMembers();
+            HashSet<Mobile> remaining = new HashSet<Mobile>(originalMembers);
+            List<List<Mobile>> components = new List<List<Mobile>>();
+
+            while (remaining.Count > 0)
+            {
+                Mobile seed = null;
+                foreach (Mobile candidate in remaining)
+                {
+                    seed = candidate;
+                    break;
+                }
+
+                if (seed == null)
+                {
+                    break;
+                }
+
+                List<Mobile> component = new List<Mobile>();
+                Queue<Mobile> queue = new Queue<Mobile>(remaining.Count);
+
+                queue.Enqueue(seed);
+                remaining.Remove(seed);
+
+                while (queue.Count > 0)
+                {
+                    Mobile current = queue.Dequeue();
+
+                    if (current == null || current.Deleted)
+                    {
+                        continue;
+                    }
+
+                    component.Add(current);
+
+                    List<Mobile> neighbors = GetConnectedMobiles(current, remaining);
+
+                    for (int i = 0; i < neighbors.Count; i++)
+                    {
+                        Mobile neighbor = neighbors[i];
+                        if (neighbor != null && remaining.Remove(neighbor))
+                        {
+                            queue.Enqueue(neighbor);
+                        }
+                    }
+                }
+
+                components.Add(component);
+            }
+
+            if (components.Count <= 1)
+            {
+                return;
+            }
+
+            AssignBattleGroup(group, components[0]);
+
+            for (int i = 1; i < components.Count; ++i)
+            {
+                BattleGroup newGroup = new BattleGroup();
+
+                AssignBattleGroup(newGroup, components[i]);
+            }
+
+            for (int i = 0; i < originalMembers.Length; i++)
+            {
+                Mobile m = originalMembers[i];
+                if (m != null && m.Aggressors.Count == 0 && m.Aggressed.Count == 0 && m.m_BattleGroup != null)
+                {
+                    m.m_BattleGroup.Remove(m);
+                    m.m_BattleGroup = null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Raccoglie i mobile connessi a quello dato tramite relazioni di aggressione.
+        /// </summary>
+        private static List<Mobile> GetConnectedMobiles(Mobile mobile, HashSet<Mobile> remaining)
+        {
+            List<Mobile> neighbors = new List<Mobile>();
+
+            List<AggressorInfo> aggressors = mobile.m_Aggressors;
+            if (aggressors != null)
+            {
+                for (int i = 0; i < aggressors.Count; ++i)
+                {
+                    Mobile attacker = aggressors[i].Attacker;
+                    if (attacker != null && remaining.Contains(attacker))
+                    {
+                        neighbors.Add(attacker);
+                    }
+                }
+            }
+
+            List<AggressorInfo> aggressed = mobile.m_Aggressed;
+            if (aggressed != null)
+            {
+                for (int i = 0; i < aggressed.Count; ++i)
+                {
+                    Mobile defender = aggressed[i].Defender;
+                    if (defender != null && remaining.Contains(defender))
+                    {
+                        neighbors.Add(defender);
+                    }
+                }
+            }
+
+            return neighbors;
+        }
+
+        private static void AssignBattleGroup(BattleGroup group, IList<Mobile> members)
+        {
+            if (group == null)
+            {
+                return;
+            }
+
+            group.ReplaceMembers(members);
+
+            for (int i = 0; i < members.Count; i++)
+            {
+                Mobile m = members[i];
+                if (m != null && !m.Deleted)
+                {
+                    m.m_BattleGroup = group;
+                }
+            }
         }
 
         private class CombatTimer : Timer
@@ -342,9 +920,9 @@ namespace Server
                 {
                     IDamageable combatant = m_Mobile.Combatant;
 
-                    // If no combatant, wrong map, one of us is a ghost, or cannot see, or deleted, then stop combat
                     if (combatant == null || combatant.Deleted || m_Mobile.m_Deleted || combatant.Map != m_Mobile.m_Map ||
-                        !combatant.Alive || !m_Mobile.Alive || !m_Mobile.CanSee(combatant) || (combatant is Mobile && ((Mobile)combatant).IsDeadBondedPet) ||
+                        !combatant.Alive || !m_Mobile.Alive || !m_Mobile.CanSee(combatant) ||
+                        (combatant is Mobile && ((Mobile)combatant).IsDeadBondedPet) ||
                         m_Mobile.IsDeadBondedPet)
                     {
                         m_Mobile.Combatant = null;
@@ -360,7 +938,7 @@ namespace Server
 
                     if (m_Mobile.InLOS(combatant))
                     {
-                        weapon.OnBeforeSwing(m_Mobile, combatant); //OnBeforeSwing for checking in regards to being hidden and whatnot
+                        weapon.OnBeforeSwing(m_Mobile, combatant);
                         m_Mobile.RevealingAction();
                         m_Mobile.m_NextCombatTime = Core.TickCount + (int)weapon.OnSwing(m_Mobile, combatant).TotalMilliseconds;
                     }
@@ -387,7 +965,5 @@ namespace Server
 
         public virtual void OnCombatantChange()
         { }
-
-        // Note: other combat-related helpers (Damage, Heal, Aggressor tracking, DamageEntry) remain in Mobile.cs
     }
 }
