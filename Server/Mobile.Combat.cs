@@ -6,14 +6,13 @@
 using Server.Network;
 using System;
 using System.Collections.Generic;
-using System.Runtime.CompilerServices;
 
 namespace Server
 {
     public partial class Mobile
     {
-        // Campi combat
-        private BattleGroup m_BattleGroup;
+        // Combat fields
+        private CombatGroup m_CombatGroup;
         private List<AggressorInfo> m_Aggressors = new List<AggressorInfo>();
         private List<AggressorInfo> m_Aggressed = new List<AggressorInfo>();
         private CombatTimer m_CombatTimer;
@@ -22,7 +21,7 @@ namespace Server
         private IDamageable m_Combatant;
         private int m_ChangingCombatant;
 
-        // Hook di inizializzazione per cleanup su delete/disconnessione
+        // Initialization hook for cleanup on delete/disconnection
         private static readonly bool s_CombatCleanupHooks = InitCombatCleanupHooks();
 
         public List<AggressorInfo> Aggressors => m_Aggressors;
@@ -34,321 +33,402 @@ namespace Server
             set => m_NextCombatTime = value;
         }
 
-        // BattleGroup property (may be null)
-        public BattleGroup Battle => m_BattleGroup;
+        // CombatGroup property (may be null)
+        public CombatGroup Group => m_CombatGroup;
 
         // Hook di inizializzazione per cleanup su delete/disconnessione
         private static bool InitCombatCleanupHooks()
         {
-            EventSink.MobileDeleted += e => CleanupBattleGroup(e.Mobile);
-            EventSink.Logout += e => CleanupBattleGroup(e.Mobile);
+            EventSink.MobileDeleted += e => CleanupCombatGroup(e.Mobile);
+            EventSink.Logout += e => CleanupCombatGroup(e.Mobile);
             return true;
         }
 
-        private static void CleanupBattleGroup(Mobile mobile)
+        private static void CleanupCombatGroup(Mobile mobile)
         {
             if (mobile == null)
             {
                 return;
             }
 
-            BattleGroup group = mobile.m_BattleGroup;
+            CombatGroup group = mobile.m_CombatGroup;
 
             if (group != null)
             {
-                group.Remove(mobile);
-                mobile.m_BattleGroup = null;
+                group.RemoveCombatant(mobile);
+                mobile.m_CombatGroup = null;
 
-                // Ripulisce membri invalidi e, se restano collegamenti, ricompone i componenti connessi
-                if (group.ValidateIntegrity())
+                // Clean invalid members and recompute components if necessary
+                if (group.ValidateGroupIntegrity())
                 {
-                    RecomputeBattleGroups(group);
+                    CombatGroup.RecalculateCombatGroups(group);
                 }
             }
         }
 
-        // BattleGroup represents a collection of Mobiles connected via combat/aggression.
-        // Annidata per poter accedere ai campi privati di Mobile.
-        public class BattleGroup
+        /// <summary>
+        /// CombatGroup: encapsulates membership and connectivity based on aggression.
+        /// Public surface minimal: external code can enumerate via ForEachCombatant only.
+        /// Internal APIs provide efficient mutation for Mobile internals.
+        /// Assumes single-threaded execution.
+        /// </summary>
+        public sealed class CombatGroup
         {
-            private readonly List<Mobile> m_Members;
-            private readonly IReadOnlyList<Mobile> m_MembersView;
+            private readonly List<Mobile> m_Combatants;
+            // Maintain a HashSet mirror for O(1) membership checks. Keeps in sync with m_Combatants.
+            private readonly HashSet<Mobile> m_CombatantSet;
+            // Hue for visual feedback of group members
+            private int m_GroupHue;
 
-            public IReadOnlyList<Mobile> Members => m_MembersView;
+            // Constants for hue generation
+            private static readonly int MinGroupHue = 1;
+            private static readonly int MaxGroupHue = 1000;
 
-            private readonly object m_Sync = new object();
-            private static readonly object s_NoopLock = new object();
-
-            public BattleGroup()
+            public CombatGroup()
             {
-                m_Members = new List<Mobile>();
-                m_MembersView = m_Members.AsReadOnly();
+                m_Combatants = new List<Mobile>();
+                m_CombatantSet = new HashSet<Mobile>();
+                m_GroupHue = Utility.Random(MinGroupHue, MaxGroupHue);
             }
 
-            public void Add(Mobile mobile)
+            // Public safe enumerator. External code should use this for read-only operations.
+            /// <summary>
+            /// Executes the specified action on each combatant in the group, using a snapshot to allow safe modifications during enumeration.
+            /// </summary>
+            /// <param name="action">The action to perform on each mobile.</param>
+            public void ForEachCombatant(Action<Mobile> action)
+            {
+                if (action == null)
+                {
+                    return;
+                }
+
+                // Use snapshot to allow safe modifications during enumeration.
+                Mobile[] snapshot = m_Combatants.ToArray();
+
+                for (int i = 0; i < snapshot.Length; i++)
+                {
+                    action(snapshot[i]);
+                }
+            }
+
+            // Internal: add/remove/count/validate are for Mobile internals only.
+            internal void AddCombatant(Mobile mobile)
             {
                 if (mobile == null || mobile.Deleted)
                 {
                     return;
                 }
 
-                BattleGroup oldGroup = mobile.m_BattleGroup;
-                if (oldGroup != null && oldGroup != this)
+                CombatGroup old = mobile.m_CombatGroup;
+
+                if (old != null && old != this)
                 {
-                    oldGroup.Remove(mobile);
+                    old.RemoveCombatant(mobile);
                 }
 
-                lock (m_Sync)
+                if (m_CombatantSet.Add(mobile))
                 {
-                    if (!m_Members.Contains(mobile))
-                    {
-                        m_Members.Add(mobile);
-                    }
-
-                    if (mobile.m_BattleGroup != this)
-                    {
-                        mobile.m_BattleGroup = this;
-                    }
+                    m_Combatants.Add(mobile);
                 }
+
+                if (mobile.m_CombatGroup != this)
+                {
+                    mobile.m_CombatGroup = this;
+                }
+
+                mobile.SolidHueOverride = m_GroupHue;
             }
 
-            public void Remove(Mobile mobile)
+            internal void RemoveCombatant(Mobile mobile)
             {
                 if (mobile == null)
                 {
                     return;
                 }
 
-                lock (m_Sync)
+                if (m_CombatantSet.Remove(mobile))
                 {
-                    m_Members.Remove(mobile);
+                    // Remove from list (O(n)) - acceptable for expected small group sizes.
+                    m_Combatants.Remove(mobile);
                 }
 
-                if (mobile.m_BattleGroup == this)
+                if (mobile.m_CombatGroup == this)
                 {
-                    mobile.m_BattleGroup = null;
+                    mobile.m_CombatGroup = null;
                 }
+
+                // Reset visual feedback
+                mobile.SolidHueOverride = -1;
             }
 
-            public int Count()
-            {
-                lock (m_Sync)
-                {
-                    return m_Members.Count;
-                }
-            }
+            internal int Count => m_CombatantSet.Count;
 
-            public bool ValidateIntegrity()
+            internal bool ValidateGroupIntegrity()
             {
-                lock (m_Sync)
-                {
-                    HashSet<Mobile> seen = null;
+                HashSet<Mobile> seen = new HashSet<Mobile>();
 
-                    for (int i = m_Members.Count - 1; i >= 0; --i)
+                for (int i = m_Combatants.Count - 1; i >= 0; --i)
+                {
+                    Mobile m = m_Combatants[i];
+
+                    if (m == null || m.Deleted || m.m_CombatGroup != this || !seen.Add(m))
                     {
-                        Mobile m = m_Members[i];
-
-                        if (m == null || m.Deleted || m.m_BattleGroup != this)
-                        {
-                            m_Members.RemoveAt(i);
-                            continue;
-                        }
-
-                        if (seen == null)
-                        {
-                            seen = new HashSet<Mobile>();
-                        }
-
-                        if (!seen.Add(m))
-                        {
-                            m_Members.RemoveAt(i);
-                        }
+                        m_Combatants.RemoveAt(i);
+                        // Reset group reference and visual feedback for removed member
+                        m.m_CombatGroup = null;
+                        m.SolidHueOverride = -1;
                     }
-
-                    return m_Members.Count > 0;
                 }
+
+                // Rebuild member set to match list after cleanup
+                m_CombatantSet.Clear();
+                for (int i = 0; i < m_Combatants.Count; ++i)
+                {
+                    Mobile m2 = m_Combatants[i];
+                    if (m2 != null)
+                    {
+                        m_CombatantSet.Add(m2);
+                    }
+                }
+
+                return m_Combatants.Count > 0;
             }
 
-            public BattleGroup Join(BattleGroup other)
+            internal CombatGroup MergeWith(CombatGroup other)
             {
                 if (other == null || other == this)
                 {
                     return this;
                 }
 
-                ValidateIntegrity();
-                other.ValidateIntegrity();
+                ValidateGroupIntegrity();
+                other.ValidateGroupIntegrity();
 
-                LockOrdered(this, other, () =>
+                HashSet<Mobile> existing = new HashSet<Mobile>(m_CombatantSet);
+
+                for (int i = 0; i < other.m_Combatants.Count; i++)
                 {
-                    for (int i = 0; i < other.m_Members.Count; i++)
-                    {
-                        Mobile m = other.m_Members[i];
-                        if (m != null && !m.Deleted && !m_Members.Contains(m))
-                        {
-                            m_Members.Add(m);
-                            m.m_BattleGroup = this;
-                        }
-                    }
+                    Mobile m = other.m_Combatants[i];
 
-                    other.m_Members.Clear();
-                });
+                    if (m != null && !m.Deleted && existing.Add(m))
+                    {
+                        m_Combatants.Add(m);
+                        m_CombatantSet.Add(m);
+                        m.m_CombatGroup = this;
+                        // Update visual feedback to match this group's hue
+                        m.SolidHueOverride = m_GroupHue;
+                    }
+                }
+
+                // Clear source
+                other.m_Combatants.Clear();
+                other.m_CombatantSet.Clear();
 
                 return this;
             }
 
-            public BattleGroup Split(IEnumerable<Mobile> membersToMove)
+            internal void SetCombatants(IEnumerable<Mobile> members)
             {
-                BattleGroup result = new BattleGroup();
-
-                if (membersToMove == null)
+                // Clear backrefs
+                for (int i = 0; i < m_Combatants.Count; i++)
                 {
-                    return result;
+                    Mobile old = m_Combatants[i];
+
+                    if (old != null && !old.Deleted && old.m_CombatGroup == this)
+                    {
+                        old.m_CombatGroup = null;
+                    }
                 }
 
-                lock (m_Sync)
+                m_Combatants.Clear();
+                m_CombatantSet.Clear();
+
+                if (members == null)
                 {
-                    foreach (Mobile m in membersToMove)
+                    return;
+                }
+
+                foreach (Mobile m in members)
+                {
+                    if (m == null || m.Deleted)
                     {
-                        if (m == null)
+                        continue;
+                    }
+
+                    CombatGroup old = m.m_CombatGroup;
+
+                    if (old != null && old != this)
+                    {
+                        // Remove the member immediately from the old group's set and list to
+                        // preserve immediate consistency. This is O(n) on the old list but
+                        // guarantees that no stale entries remain during subsequent operations.
+                        old.m_CombatantSet.Remove(m);
+                        old.m_Combatants.Remove(m);
+
+                        // Validate to ensure the old group's internal state is consistent.
+                        old.ValidateGroupIntegrity();
+                    }
+
+                    if (m_CombatantSet.Add(m))
+                    {
+                        m_Combatants.Add(m);
+                    }
+
+                    if (m.m_CombatGroup != this)
+                    {
+                        m.m_CombatGroup = this;
+                        // Set visual feedback for the new group
+                        m.SolidHueOverride = m_GroupHue;
+                    }
+                }
+            }
+
+            // Internal: compute components using BFS over aggression graph.
+            // Note: component discovery is performed inline inside SplitIntoCombatSubgroups
+            // to avoid allocating an intermediate List<List<Mobile>> when the caller only
+            // needs to assign the components immediately.
+            internal void SplitIntoCombatSubgroups()
+            {
+                if (!ValidateGroupIntegrity() || Count <= 1)
+                {
+                    return;
+                }
+
+                Mobile[] snapshot = m_Combatants.ToArray();
+                HashSet<Mobile> remaining = new HashSet<Mobile>(snapshot);
+
+                bool firstAssigned = false;
+
+                while (remaining.Count > 0)
+                {
+                    Mobile seed = null;
+
+                    foreach (Mobile candidate in remaining)
+                    {
+                        seed = candidate;
+                        break;
+                    }
+
+                    if (seed == null)
+                    {
+                        break;
+                    }
+
+                    List<Mobile> component = new List<Mobile>();
+                    Queue<Mobile> queue = new Queue<Mobile>(remaining.Count);
+
+                    queue.Enqueue(seed);
+                    remaining.Remove(seed);
+
+                    while (queue.Count > 0)
+                    {
+                        Mobile current = queue.Dequeue();
+
+                        if (current == null || current.Deleted)
                         {
                             continue;
                         }
 
-                        if (m_Members.Remove(m))
+                        component.Add(current);
+
+                        // Enqueue neighbors directly without creating a temporary list
+                        EnqueueAggressionLinks(current, remaining, queue);
+                    }
+
+                    if (!firstAssigned)
+                    {
+                        // Assign first component to this group
+                        SetCombatants(component);
+                        firstAssigned = true;
+                    }
+                    else
+                    {
+                        CombatGroup newGroup = new CombatGroup();
+                        newGroup.SetCombatants(component);
+                    }
+                }
+            }
+
+            // Enqueues neighbors (aggressors and aggressed defenders) that are present in 'remaining'
+            // directly into the BFS queue; avoids allocating temporary neighbor lists.
+            private void EnqueueAggressionLinks(Mobile mobile, HashSet<Mobile> remaining, Queue<Mobile> queue)
+            {
+                List<AggressorInfo> aggressors = mobile.m_Aggressors;
+
+                if (aggressors != null)
+                {
+                    for (int i = 0; i < aggressors.Count; ++i)
+                    {
+                        Mobile attacker = aggressors[i].Attacker;
+                        if (attacker != null && remaining.Remove(attacker))
                         {
-                            result.Add(m);
-                            if (m.m_BattleGroup != result)
-                            {
-                                m.m_BattleGroup = result;
-                            }
+                            queue.Enqueue(attacker);
                         }
                     }
                 }
 
-                return result;
-            }
+                List<AggressorInfo> aggressed = mobile.m_Aggressed;
 
-            public Mobile[] SnapshotMembers()
-            {
-                lock (m_Sync)
+                if (aggressed != null)
                 {
-                    return m_Members.ToArray();
-                }
-            }
-
-            public void ReplaceMembers(IEnumerable<Mobile> members)
-            {
-                List<Mobile> toClear;
-                lock (m_Sync)
-                {
-                    toClear = new List<Mobile>(m_Members);
-                }
-
-                for (int i = 0; i < toClear.Count; i++)
-                {
-                    Mobile old = toClear[i];
-                    if (old != null && !old.Deleted && old.m_BattleGroup == this)
+                    for (int i = 0; i < aggressed.Count; ++i)
                     {
-                        old.m_BattleGroup = null;
-                    }
-                }
-
-                List<Mobile> toAdd = new List<Mobile>();
-                if (members != null)
-                {
-                    foreach (Mobile m in members)
-                    {
-                        if (m != null && !m.Deleted)
+                        Mobile defender = aggressed[i].Defender;
+                        if (defender != null && remaining.Remove(defender))
                         {
-                            BattleGroup oldGroup = m.m_BattleGroup;
-                            if (oldGroup != null && oldGroup != this)
-                            {
-                                oldGroup.Remove(m);
-                            }
-
-                            toAdd.Add(m);
-                        }
-                    }
-                }
-
-                lock (m_Sync)
-                {
-                    m_Members.Clear();
-
-                    for (int i = 0; i < toAdd.Count; i++)
-                    {
-                        Mobile m = toAdd[i];
-                        m_Members.Add(m);
-                        if (m.m_BattleGroup != this)
-                        {
-                            m.m_BattleGroup = this;
+                            queue.Enqueue(defender);
                         }
                     }
                 }
             }
 
-            public void ForEachMember(Action<Mobile> action)
+            internal void AssignCombatants(IEnumerable<Mobile> members)
             {
-                if (action == null)
-                {
-                    return;
-                }
-
-                Mobile[] copy;
-                lock (m_Sync)
-                {
-                    copy = m_Members.ToArray();
-                }
-
-                for (int i = 0; i < copy.Length; i++)
-                {
-                    action(copy[i]);
-                }
+                SetCombatants(members);
             }
 
-            private static void LockOrdered(BattleGroup a, BattleGroup b, Action action)
+            // SplitIntoCombatSubgroups implemented above (inline BFS).
+            // The older implementation that built an intermediate List<List<Mobile>> was removed
+            // to avoid unnecessary allocations. This placeholder remains for readability.
+            internal static void MergeCombatGroups(CombatGroup group1, CombatGroup group2)
             {
-                if (action == null)
+                if (group1 != null && !group1.ValidateGroupIntegrity())
+                {
+                    group1 = null;
+                }
+
+                if (group2 != null && !group2.ValidateGroupIntegrity())
+                {
+                    group2 = null;
+                }
+
+                if (group1 == null || group2 == null)
                 {
                     return;
                 }
 
-                if (a == null || b == null || ReferenceEquals(a, b))
-                {
-                    lock ((a ?? b)?.m_Sync ?? s_NoopLock)
-                    {
-                        action();
-                    }
+                CombatGroup target = group1.Count >= group2.Count ? group1 : group2;
+                CombatGroup source = ReferenceEquals(target, group1) ? group2 : group1;
 
+                target.MergeWith(source);
+
+                target.SplitIntoCombatSubgroups();
+            }
+
+            internal static void RecalculateCombatGroups(CombatGroup group)
+            {
+                if (group == null)
+                {
                     return;
                 }
 
-                BattleGroup first = a;
-                BattleGroup second = b;
-
-                int h1 = RuntimeHelpers.GetHashCode(first.m_Sync);
-                int h2 = RuntimeHelpers.GetHashCode(second.m_Sync);
-
-                if (h1 > h2 || (h1 == h2 && RuntimeHelpers.GetHashCode(first) > RuntimeHelpers.GetHashCode(second)))
-                {
-                    first = b;
-                    second = a;
-                }
-
-                lock (first.m_Sync)
-                {
-                    lock (second.m_Sync)
-                    {
-                        action();
-                    }
-                }
+                group.SplitIntoCombatSubgroups();
             }
         }
 
-        /// <summary>
-        /// Overridable. Gets or sets which Mobile that this Mobile is currently engaged in combat with.
-        /// </summary>
+        // Mobile logic unchanged below (Combatant, timers, aggressive actions, etc.)
+
         public virtual IDamageable Combatant
         {
             get => m_Combatant;
@@ -533,7 +613,7 @@ namespace Server
 
             if (addAggressor)
             {
-                // istanza per il lato “attacker -> this”
+                // Instance for the “attacker -> this” side
                 AggressorInfo ai = AggressorInfo.Create(aggressor, this, criminal);
                 m_Aggressors.Add(ai);
 
@@ -552,7 +632,7 @@ namespace Server
 
             if (addAggressed)
             {
-                // istanza separata per il lato “this <- attacker”
+                // Separate instance for the “this <- attacker” side
                 AggressorInfo ai = AggressorInfo.Create(aggressor, this, criminal);
                 aggressor.m_Aggressed.Add(ai);
 
@@ -572,7 +652,7 @@ namespace Server
             // Manage BattleGroup relationships based on aggression
             if (addAggressor || addAggressed)
             {
-                EnsureBattleGroupWith(aggressor);
+                EnsureCombatGroupWith(aggressor);
             }
 
             if (setCombatant && !Hidden)
@@ -611,7 +691,7 @@ namespace Server
             }
 
             UpdateAggrExpire();
-            CheckBattleGroupIntegrity();
+            CheckCombatGroupIntegrity();
         }
 
         public void RemoveAggressor(Mobile aggressor)
@@ -642,260 +722,91 @@ namespace Server
             }
 
             UpdateAggrExpire();
-            CheckBattleGroupIntegrity();
+            CheckCombatGroupIntegrity();
         }
 
         /// <summary>
-        /// Verifica l'integrità del BattleGroup e lo pulisce se necessario.
-        /// Se il mobile non ha più link di aggressione, viene rimosso dal BattleGroup.
-        /// Se il BattleGroup si è frammentato, viene ricomputato.
+        /// Checks the integrity of the CombatGroup and cleans it if necessary.
+        /// If the mobile no longer has aggression links, it is removed from the CombatGroup.
+        /// If the CombatGroup has fragmented, it is recomputed.
         /// </summary>
-        private void CheckBattleGroupIntegrity()
+        private void CheckCombatGroupIntegrity()
         {
-            if (m_BattleGroup == null)
+            if (m_CombatGroup == null)
             {
                 return;
             }
 
             // Rimuove membri non validi e, se il gruppo resta vuoto, annulla il riferimento
-            if (!m_BattleGroup.ValidateIntegrity())
+            if (!m_CombatGroup.ValidateGroupIntegrity())
             {
-                m_BattleGroup = null;
+                m_CombatGroup = null;
                 return;
             }
 
             if (m_Aggressors.Count > 0 || m_Aggressed.Count > 0)
             {
-                RecomputeBattleGroups(m_BattleGroup);
+                CombatGroup.RecalculateCombatGroups(m_CombatGroup);
                 return;
             }
 
-            m_BattleGroup.Remove(this);
-            m_BattleGroup = null;
+            m_CombatGroup.RemoveCombatant(this);
+            m_CombatGroup = null;
         }
 
         /// <summary>
-        /// Assicura che due mobile siano nello stesso BattleGroup, creandone uno nuovo o unendone due esistenti.
+        /// Ensures that two mobiles are in the same CombatGroup, creating a new one or merging existing ones.
         /// </summary>
-        private void EnsureBattleGroupWith(Mobile other)
+        private void EnsureCombatGroupWith(Mobile other)
         {
             if (other == null || other == this)
             {
                 return;
             }
 
-            BattleGroup g1 = m_BattleGroup;
-            BattleGroup g2 = other.m_BattleGroup;
+            CombatGroup g1 = m_CombatGroup;
+            CombatGroup g2 = other.m_CombatGroup;
 
-            if (g1 != null && !g1.ValidateIntegrity())
+            if (g1 != null && !g1.ValidateGroupIntegrity())
             {
                 g1 = null;
-                m_BattleGroup = null;
+                m_CombatGroup = null;
             }
 
-            if (g2 != null && !g2.ValidateIntegrity())
+            if (g2 != null && !g2.ValidateGroupIntegrity())
             {
                 g2 = null;
-                other.m_BattleGroup = null;
+                other.m_CombatGroup = null;
             }
 
             if (g1 == null && g2 == null)
             {
-                BattleGroup newGroup = new BattleGroup();
-                newGroup.Add(this);
-                newGroup.Add(other);
+                CombatGroup newGroup = new CombatGroup();
+                newGroup.AddCombatant(this);
+                newGroup.AddCombatant(other);
 
-                m_BattleGroup = newGroup;
-                other.m_BattleGroup = newGroup;
+                m_CombatGroup = newGroup;
+                other.m_CombatGroup = newGroup;
                 return;
             }
 
             if (g1 == null && g2 != null)
             {
-                g2.Add(this);
-                m_BattleGroup = g2;
+                g2.AddCombatant(this);
+                m_CombatGroup = g2;
                 return;
             }
 
             if (g1 != null && g2 == null)
             {
-                g1.Add(other);
-                other.m_BattleGroup = g1;
+                g1.AddCombatant(other);
+                other.m_CombatGroup = g1;
                 return;
             }
 
-            if (g1 != null && g2 != null && g1 != g2)
+            if (g1 != null && g2 != null && !ReferenceEquals(g1, g2))
             {
-                MergeBattleGroups(g1, g2);
-            }
-        }
-
-        /// <summary>
-        /// Unisce due BattleGroup, mantenendo il più grande e trasferendo i membri dell'altro.
-        /// </summary>
-        private void MergeBattleGroups(BattleGroup group1, BattleGroup group2)
-        {
-            if (group1 != null && !group1.ValidateIntegrity())
-            {
-                group1 = null;
-            }
-
-            if (group2 != null && !group2.ValidateIntegrity())
-            {
-                group2 = null;
-            }
-
-            if (group1 == null || group2 == null)
-            {
-                return;
-            }
-
-            BattleGroup targetGroup = group1.Count() >= group2.Count() ? group1 : group2;
-            BattleGroup sourceGroup = targetGroup == group1 ? group2 : group1;
-
-            targetGroup.Join(sourceGroup);
-
-            AssignBattleGroup(targetGroup, targetGroup.SnapshotMembers());
-        }
-
-        /// <summary>
-        /// Ricomputa i componenti connessi all'interno di un BattleGroup e divide se necessario.
-        /// Questo garantisce che solo i mobile collegati tramite aggressione rimangono nello stesso gruppo.
-        /// </summary>
-        private static void RecomputeBattleGroups(BattleGroup group)
-        {
-            if (group == null || !group.ValidateIntegrity() || group.Count() <= 1)
-            {
-                return;
-            }
-
-            Mobile[] originalMembers = group.SnapshotMembers();
-            HashSet<Mobile> remaining = new HashSet<Mobile>(originalMembers);
-            List<List<Mobile>> components = new List<List<Mobile>>();
-
-            while (remaining.Count > 0)
-            {
-                Mobile seed = null;
-                foreach (Mobile candidate in remaining)
-                {
-                    seed = candidate;
-                    break;
-                }
-
-                if (seed == null)
-                {
-                    break;
-                }
-
-                List<Mobile> component = new List<Mobile>();
-                Queue<Mobile> queue = new Queue<Mobile>(remaining.Count);
-
-                queue.Enqueue(seed);
-                remaining.Remove(seed);
-
-                while (queue.Count > 0)
-                {
-                    Mobile current = queue.Dequeue();
-
-                    if (current == null || current.Deleted)
-                    {
-                        continue;
-                    }
-
-                    component.Add(current);
-
-                    List<Mobile> neighbors = GetConnectedMobiles(current, remaining);
-
-                    for (int i = 0; i < neighbors.Count; i++)
-                    {
-                        Mobile neighbor = neighbors[i];
-                        if (neighbor != null && remaining.Remove(neighbor))
-                        {
-                            queue.Enqueue(neighbor);
-                        }
-                    }
-                }
-
-                components.Add(component);
-            }
-
-            if (components.Count <= 1)
-            {
-                return;
-            }
-
-            AssignBattleGroup(group, components[0]);
-
-            for (int i = 1; i < components.Count; ++i)
-            {
-                BattleGroup newGroup = new BattleGroup();
-
-                AssignBattleGroup(newGroup, components[i]);
-            }
-
-            for (int i = 0; i < originalMembers.Length; i++)
-            {
-                Mobile m = originalMembers[i];
-                if (m != null && m.Aggressors.Count == 0 && m.Aggressed.Count == 0 && m.m_BattleGroup != null)
-                {
-                    m.m_BattleGroup.Remove(m);
-                    m.m_BattleGroup = null;
-                }
-            }
-        }
-
-        /// <summary>
-        /// Raccoglie i mobile connessi a quello dato tramite relazioni di aggressione.
-        /// </summary>
-        private static List<Mobile> GetConnectedMobiles(Mobile mobile, HashSet<Mobile> remaining)
-        {
-            List<Mobile> neighbors = new List<Mobile>();
-
-            List<AggressorInfo> aggressors = mobile.m_Aggressors;
-            if (aggressors != null)
-            {
-                for (int i = 0; i < aggressors.Count; ++i)
-                {
-                    Mobile attacker = aggressors[i].Attacker;
-                    if (attacker != null && remaining.Contains(attacker))
-                    {
-                        neighbors.Add(attacker);
-                    }
-                }
-            }
-
-            List<AggressorInfo> aggressed = mobile.m_Aggressed;
-            if (aggressed != null)
-            {
-                for (int i = 0; i < aggressed.Count; ++i)
-                {
-                    Mobile defender = aggressed[i].Defender;
-                    if (defender != null && remaining.Contains(defender))
-                    {
-                        neighbors.Add(defender);
-                    }
-                }
-            }
-
-            return neighbors;
-        }
-
-        private static void AssignBattleGroup(BattleGroup group, IList<Mobile> members)
-        {
-            if (group == null)
-            {
-                return;
-            }
-
-            group.ReplaceMembers(members);
-
-            for (int i = 0; i < members.Count; i++)
-            {
-                Mobile m = members[i];
-                if (m != null && !m.Deleted)
-                {
-                    m.m_BattleGroup = group;
-                }
+                CombatGroup.MergeCombatGroups(g1, g2);
             }
         }
 
